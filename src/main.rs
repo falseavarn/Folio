@@ -33,7 +33,11 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Folio")
             .with_inner_size([1120.0, 720.0])
-            .with_min_inner_size([820.0, 480.0]),
+            .with_min_inner_size([820.0, 480.0])
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../icons/128x128@2x.png"))
+                    .expect("bundled icon is a valid PNG"),
+            ),
         ..Default::default()
     };
     eframe::run_native(
@@ -174,7 +178,10 @@ impl App {
             .frame(Frame::NONE.fill(RAISED).inner_margin(16.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    mark(ui);
+                    ui.add(
+                        egui::Image::new(egui::include_image!("../icons/64x64.png"))
+                            .fit_to_exact_size(vec2(24.0, 24.0)),
+                    );
                     ui.label(RichText::new("Folio").size(20.0).strong().color(CANVAS));
                 });
                 ui.add_space(20.0);
@@ -571,20 +578,6 @@ fn nav_row(ui: &mut egui::Ui, active: bool, name: &str, count: usize) -> bool {
             .min_size(vec2(ui.available_width(), 30.0)),
     )
     .clicked()
-}
-
-/// Folio's mark: two stacked sheets.
-fn mark(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(vec2(22.0, 22.0), egui::Sense::hover());
-    let sheet =
-        |dx: f32, dy: f32| egui::Rect::from_min_size(rect.min + vec2(dx, dy), vec2(16.0, 18.0));
-    ui.painter().rect_filled(
-        sheet(6.0, 0.0),
-        CornerRadius::same(2),
-        MOSS.gamma_multiply(0.45),
-    );
-    ui.painter()
-        .rect_filled(sheet(0.0, 4.0), CornerRadius::same(2), MOSS);
 }
 
 /// One asset in the list. Returns true when its Edit button was pressed.

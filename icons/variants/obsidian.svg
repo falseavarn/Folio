@@ -1,0 +1,10 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Folio</title>
+  <rect width="1024" height="1024" rx="225" fill="#111315"/>
+  <g transform="translate(205 243) scale(0.6)">
+  <g stroke-width="80" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M27.5 340V117.5A90 90 0 0 1 117.5 27.5H342C364 27.5 378 38 391 55L444 121C458 139 478 151.3 512 151.3" stroke="#8BC34A"/>
+    <path d="M602 151.3H896.5A100 100 0 0 1 996.5 251.3V768A100 100 0 0 1 896.5 868H127.5A100 100 0 0 1 27.5 768V430" stroke="#FAFAF9"/>
+  </g>
+  </g>
+</svg>
