@@ -16,7 +16,7 @@ const MOSS: Color32 = Color32::from_rgb(0x8B, 0xC3, 0x4A);
 const DANGER: Color32 = Color32::from_rgb(0xF8, 0x71, 0x71);
 
 fn main() -> eframe::Result {
-    let store = match Store::open(Store::default_root()) {
+    let mut store = match Store::open(Store::default_root()) {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("Folio could not open its library: {e}");
@@ -31,6 +31,7 @@ fn main() -> eframe::Result {
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_app_id("folio")
             .with_title("Folio")
             .with_inner_size([1120.0, 720.0])
             .with_min_inner_size([820.0, 480.0])
@@ -46,7 +47,7 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             style(&cc.egui_ctx);
-            Ok(Box::new(App::new(store)))
+            Ok(Box::new(App::new(&mut store)))
         }),
     )
 }
@@ -118,24 +119,33 @@ struct Draft {
     error: Option<String>,
 }
 
+/// The new-project form in the sidebar. `dir` is None until the user picks a folder.
+struct NewProject {
+    name: String,
+    dir: Option<PathBuf>,
+}
+
 enum Confirm {
     Project(u64),
     Asset(u64),
 }
 
-struct App {
-    store: Store,
+struct App<'a> {
+    store: &'a mut Store,
     project: Option<u64>,
     filter: Filter,
-    new_project: Option<String>,
+    new_project: Option<NewProject>,
     rename: Option<String>,
     draft: Option<Draft>,
     confirm: Option<Confirm>,
     error: Option<String>,
+    /// A success message for the status bar, such as where an export was saved.
+    notice: Option<String>,
 }
 
-impl App {
-    fn new(store: Store) -> Self {
+impl<'a> App<'a> {
+    fn new(store: &'a mut Store) -> Self {
+        let error = (!store.warnings.is_empty()).then(|| store.warnings.join(" "));
         Self {
             store,
             project: None,
@@ -144,7 +154,8 @@ impl App {
             rename: None,
             draft: None,
             confirm: None,
-            error: None,
+            error,
+            notice: None,
         }
     }
 
@@ -162,7 +173,12 @@ impl App {
                 id: None,
                 kind: Kind::Link { url: String::new() },
                 description: String::new(),
-                projects: self.project.into_iter().collect(),
+                // The open project, or the only one there is.
+                projects: match (self.project, self.store.lib.projects.as_slice()) {
+                    (Some(p), _) => vec![p],
+                    (None, [only]) => vec![only.id],
+                    _ => Vec::new(),
+                },
                 picked: None,
                 error: None,
             },
@@ -204,20 +220,50 @@ impl App {
                 match &mut self.new_project {
                     None => {
                         if ui.button("New project").clicked() {
-                            self.new_project = Some(String::new());
+                            self.new_project = Some(NewProject {
+                                name: String::new(),
+                                dir: None,
+                            });
                         }
                     }
-                    Some(name) => {
+                    Some(form) => {
                         ui.label("Project name");
-                        let edit =
-                            ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
-                        if !edit.has_focus() && name.is_empty() {
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(&mut form.name).desired_width(f32::INFINITY),
+                        );
+                        if !edit.has_focus() && form.name.is_empty() && form.dir.is_none() {
                             edit.request_focus();
                         }
                         let enter =
                             edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        ui.label("Saved in");
+                        let dir = form
+                            .dir
+                            .clone()
+                            .unwrap_or_else(|| self.store.suggested_dir(&form.name));
+                        ui.label(
+                            RichText::new(dir.display().to_string())
+                                .color(MUTED)
+                                .size(13.0),
+                        );
+                        if ui.button("Choose folder…").clicked()
+                            && let Some(picked) = rfd::FileDialog::new()
+                                .set_directory(dir.parent().unwrap_or(&dir))
+                                .pick_folder()
+                        {
+                            form.dir = Some(picked);
+                        }
+                        if dir.join(store::PROJECT_FILE).exists() {
+                            ui.label(
+                                RichText::new(
+                                    "This folder already holds a Folio project. Creating opens it.",
+                                )
+                                .color(MUTED)
+                                .size(13.0),
+                            );
+                        }
                         ui.horizontal(|ui| {
-                            let ok = !name.trim().is_empty();
+                            let ok = !form.name.trim().is_empty() || form.dir.is_some();
                             create =
                                 ui.add_enabled(ok, primary("Create")).clicked() || (ok && enter);
                             cancel_new = ui.button("Cancel").clicked();
@@ -228,10 +274,22 @@ impl App {
         if cancel_new {
             self.new_project = None;
         }
-        if create {
-            let name = self.new_project.take().unwrap_or_default();
-            if let Some(id) = report(&mut self.error, self.store.add_project(&name)) {
-                select = Some(Some(id));
+        if create && let Some(form) = self.new_project.take() {
+            let dir = form
+                .dir
+                .unwrap_or_else(|| self.store.suggested_dir(&form.name));
+            match report(
+                &mut self.error,
+                self.store.add_project(&form.name, dir.clone()),
+            ) {
+                Some(id) => select = Some(Some(id)),
+                // Keep the form open with what was entered so the error can be fixed.
+                None => {
+                    self.new_project = Some(NewProject {
+                        name: form.name,
+                        dir: Some(dir),
+                    })
+                }
             }
         }
         if let Some(p) = select {
@@ -244,7 +302,7 @@ impl App {
         egui::Panel::bottom("status")
             .frame(Frame::NONE.fill(RAISED).inner_margin(8.0))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(format!("Library: {}", self.store.root().display()))
                             .color(MUTED)
@@ -252,163 +310,166 @@ impl App {
                     );
                     if let Some(e) = &self.error {
                         ui.label(RichText::new(e).color(DANGER));
+                    } else if let Some(n) = &self.notice {
+                        ui.label(RichText::new(n).color(MUTED).small());
                     }
                 });
             });
     }
 
     fn editor_panel(&mut self, ui: &mut egui::Ui) {
-        let (mut save, mut cancel, mut delete) = (false, false, None);
-        let store = &self.store;
-        let Some(d) = &mut self.draft else { return };
+        if self.draft.is_none() {
+            return;
+        }
         egui::Panel::right("editor")
             .resizable(false)
             .exact_size(360.0)
             .frame(Frame::NONE.fill(RAISED).inner_margin(20.0))
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading(if d.id.is_some() {
-                        "Edit asset"
-                    } else {
-                        "New asset"
-                    });
-                    ui.add_space(8.0);
-                    if d.id.is_none() {
-                        ui.horizontal(|ui| {
-                            for (label, kind) in [
-                                ("Link", Kind::Link { url: String::new() }),
-                                (
-                                    "Image",
-                                    Kind::Image {
-                                        file: String::new(),
-                                    },
-                                ),
-                                (
-                                    "Note",
-                                    Kind::Note {
-                                        body: String::new(),
-                                    },
-                                ),
-                            ] {
-                                let on = std::mem::discriminant(&d.kind)
-                                    == std::mem::discriminant(&kind);
-                                if ui.selectable_label(on, label).clicked() && !on {
-                                    d.kind = kind;
-                                    d.error = None;
-                                }
-                            }
-                        });
-                        ui.add_space(8.0);
-                    }
-                    match &mut d.kind {
-                        Kind::Link { url } => {
-                            ui.label("Link");
-                            ui.add(
-                                egui::TextEdit::singleline(url)
-                                    .hint_text("https://")
-                                    .desired_width(f32::INFINITY),
-                            );
-                        }
-                        Kind::Image { file } => {
-                            ui.label("Image");
-                            let shown = d
-                                .picked
-                                .clone()
-                                .or_else(|| (!file.is_empty()).then(|| store.image_path(file)));
-                            if let Some(path) = &shown {
-                                ui.add(
-                                    egui::Image::new(format!("file://{}", path.display()))
-                                        .max_width(ui.available_width())
-                                        .max_height(220.0),
-                                );
-                            }
-                            if ui
-                                .button(if shown.is_some() {
-                                    "Replace image…"
-                                } else {
-                                    "Choose image…"
-                                })
-                                .clicked()
-                                && let Some(p) = rfd::FileDialog::new()
-                                    .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"])
-                                    .pick_file()
-                            {
-                                d.picked = Some(p);
-                            }
-                        }
-                        Kind::Note { body } => {
-                            ui.label("Note");
-                            ui.add(
-                                egui::TextEdit::multiline(body)
-                                    .desired_rows(8)
-                                    .desired_width(f32::INFINITY),
-                            );
-                        }
-                    }
-                    ui.add_space(8.0);
-                    ui.label("Description (optional)");
-                    ui.add(
-                        egui::TextEdit::multiline(&mut d.description)
-                            .desired_rows(3)
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.add_space(8.0);
-                    ui.label("Projects");
-                    if store.lib.projects.is_empty() {
-                        ui.label(RichText::new("Create a project first.").color(MUTED));
-                    }
-                    for p in &store.lib.projects {
-                        let mut on = d.projects.contains(&p.id);
-                        if ui.checkbox(&mut on, &p.name).changed() {
-                            if on {
-                                d.projects.push(p.id);
-                            } else {
-                                d.projects.retain(|&id| id != p.id);
-                            }
-                        }
-                    }
-                    if let Some(e) = &d.error {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new(e).color(DANGER));
-                    }
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        save = ui.add(primary("Save")).clicked();
-                        cancel = ui.button("Cancel").clicked();
-                        if let Some(id) = d.id {
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button(RichText::new("Delete").color(DANGER)).clicked() {
-                                    delete = Some(id);
-                                }
-                            });
-                        }
-                    });
-                });
+                egui::ScrollArea::vertical().show(ui, |ui| self.editor_form(ui));
             });
+    }
+
+    fn editor_form(&mut self, ui: &mut egui::Ui) {
+        let (mut save, mut cancel, mut delete) = (false, false, None);
+        let store = &*self.store;
+        let Some(d) = &mut self.draft else { return };
+        ui.heading(if d.id.is_some() {
+            "Edit asset"
+        } else {
+            "New asset"
+        });
+        ui.add_space(8.0);
+        if d.id.is_none() {
+            ui.horizontal(|ui| {
+                for (label, kind) in [
+                    ("Link", Kind::Link { url: String::new() }),
+                    (
+                        "Image",
+                        Kind::Image {
+                            file: String::new(),
+                        },
+                    ),
+                    (
+                        "Note",
+                        Kind::Note {
+                            body: String::new(),
+                        },
+                    ),
+                ] {
+                    let on = std::mem::discriminant(&d.kind) == std::mem::discriminant(&kind);
+                    if ui.selectable_label(on, label).clicked() && !on {
+                        d.kind = kind;
+                        d.error = None;
+                    }
+                }
+            });
+            ui.add_space(8.0);
+        }
+        match &mut d.kind {
+            Kind::Link { url } => {
+                ui.label("Link");
+                ui.add(
+                    egui::TextEdit::singleline(url)
+                        .hint_text("https://")
+                        .desired_width(f32::INFINITY),
+                );
+            }
+            Kind::Image { .. } => {
+                ui.label("Image");
+                let saved =
+                    d.id.and_then(|id| store.lib.assets.iter().find(|a| a.id == id))
+                        .and_then(|a| store.image_of(a));
+                let shown = d.picked.clone().or(saved);
+                if let Some(path) = &shown {
+                    ui.add(
+                        egui::Image::new(format!("file://{}", path.display()))
+                            .max_width(ui.available_width())
+                            .max_height(220.0),
+                    );
+                }
+                if ui
+                    .button(if shown.is_some() {
+                        "Replace image…"
+                    } else {
+                        "Choose image…"
+                    })
+                    .clicked()
+                    && let Some(p) = rfd::FileDialog::new()
+                        .add_filter("Images", &store::IMAGE_EXTENSIONS)
+                        .pick_file()
+                {
+                    d.picked = Some(p);
+                }
+            }
+            Kind::Note { body } => {
+                ui.label("Note");
+                ui.add(
+                    egui::TextEdit::multiline(body)
+                        .desired_rows(8)
+                        .desired_width(f32::INFINITY),
+                );
+            }
+        }
+        ui.add_space(8.0);
+        ui.label("Description (optional)");
+        ui.add(
+            egui::TextEdit::multiline(&mut d.description)
+                .desired_rows(3)
+                .desired_width(f32::INFINITY),
+        );
+        ui.add_space(8.0);
+        ui.label("Projects");
+        if store.lib.projects.is_empty() {
+            ui.label(RichText::new("Create a project first.").color(MUTED));
+        }
+        for p in &store.lib.projects {
+            let mut on = d.projects.contains(&p.id);
+            if ui.checkbox(&mut on, &p.name).changed() {
+                if on {
+                    d.projects.push(p.id);
+                } else {
+                    d.projects.retain(|&id| id != p.id);
+                }
+            }
+        }
+        if let Some(e) = &d.error {
+            ui.add_space(8.0);
+            ui.label(RichText::new(e).color(DANGER));
+        }
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            save = ui.add(primary("Save")).clicked();
+            cancel = ui.button("Cancel").clicked();
+            if let Some(id) = d.id {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button(RichText::new("Delete").color(DANGER)).clicked() {
+                        delete = Some(id);
+                    }
+                });
+            }
+        });
         if save {
-            let r = self.store.put_asset(
+            match self.store.put_asset(
                 d.id,
                 d.kind.clone(),
                 &d.description,
                 d.projects.clone(),
                 d.picked.as_deref(),
-            );
-            match r {
+            ) {
                 Ok(()) => self.draft = None,
                 Err(e) => d.error = Some(e.to_string()),
             }
-        }
-        if cancel {
+        } else if cancel {
             self.draft = None;
-        }
-        if delete.is_some() {
+        } else if delete.is_some() {
             self.confirm = delete.map(Confirm::Asset);
         }
     }
 
     fn assets_panel(&mut self, ui: &mut egui::Ui) {
         let mut edit = None;
-        let (mut add, mut rename_to, mut delete) = (false, None, false);
+        let (mut add, mut rename_to, mut delete, mut export) = (false, None, false, None);
         egui::CentralPanel::default().frame(Frame::NONE.fill(OBSIDIAN).inner_margin(24.0)).show(ui, |ui| {
             let lib = &self.store.lib;
             ui.horizontal(|ui| {
@@ -432,6 +493,14 @@ impl App {
                         if ui.button("Rename").clicked() {
                             *rename = Some(name.to_string());
                         }
+                        if ui.button("Export for AI…").clicked() {
+                            export = Some(id);
+                        }
+                        if ui.button("Open folder").clicked()
+                            && let Some(p) = self.store.project(id)
+                        {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(format!("file://{}", p.dir.display())));
+                        }
                         if ui.button(RichText::new("Delete").color(DANGER)).clicked() {
                             delete = true;
                         }
@@ -442,6 +511,9 @@ impl App {
                     add = r.on_disabled_hover_text("Create a project first.").clicked();
                 });
             });
+            if let Some(p) = self.project.and_then(|id| self.store.project(id)) {
+                ui.label(RichText::new(p.dir.display().to_string()).color(MUTED).size(13.0));
+            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 for (f, label) in Filter::ALL {
@@ -452,8 +524,9 @@ impl App {
             });
             ui.add_space(12.0);
 
-            let shown: Vec<&Asset> =
-                lib.assets.iter().rev().filter(|a| self.project.is_none_or(|p| a.projects.contains(&p)) && self.filter.matches(&a.kind)).collect();
+            let mut shown: Vec<&Asset> =
+                lib.assets.iter().filter(|a| self.project.is_none_or(|p| a.projects.contains(&p)) && self.filter.matches(&a.kind)).collect();
+            shown.sort_by_key(|a| std::cmp::Reverse(a.added));
             if shown.is_empty() {
                 let msg = if lib.projects.is_empty() {
                     "Create a project in the sidebar, then add the links, images and notes you collect for it."
@@ -468,7 +541,7 @@ impl App {
             }
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for a in shown {
-                    if asset_row(ui, &self.store, a) {
+                    if asset_row(ui, self.store, a) {
                         edit = Some(a.id);
                     }
                     ui.add_space(4.0);
@@ -490,6 +563,27 @@ impl App {
         if delete {
             self.confirm = self.project.map(Confirm::Project);
         }
+        if let Some(id) = export {
+            self.export(id);
+        }
+    }
+
+    /// Saves the project's Markdown summary where the user chooses, by default inside the project folder.
+    fn export(&mut self, id: u64) {
+        let (Some(p), Some(md)) = (self.store.project(id), self.store.export_markdown(id)) else {
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_directory(&p.dir)
+            .set_file_name(format!("{}.md", p.name.replace(['/', '\\'], "-")))
+            .add_filter("Markdown", &["md"])
+            .save_file()
+        else {
+            return;
+        };
+        if report(&mut self.error, std::fs::write(&path, md)).is_some() {
+            self.notice = Some(format!("Exported {}", path.display()));
+        }
     }
 
     fn confirm_window(&mut self, ui: &mut egui::Ui) {
@@ -498,15 +592,18 @@ impl App {
             Confirm::Project(id) => (
                 "Delete project?",
                 format!(
-                    "“{}” will be deleted, along with {} tagged only with it and their image files. Assets that also belong to other projects are kept.",
+                    "“{}” will be deleted, along with {} tagged only with it. Folio removes its project file and image copies from {}; anything else you put in that folder stays. Assets that also belong to other projects are kept.",
                     self.store.project_name(id),
                     match self.store.only_in(id) {
                         1 => "1 asset".to_string(),
                         n => format!("{n} assets"),
-                    }
+                    },
+                    self.store.project(id).map(|p| p.dir.display().to_string()).unwrap_or_default(),
                 ),
             ),
-            Confirm::Asset(_) => ("Delete asset?", "This asset will be deleted. If it is an image, its file in the library is deleted too.".into()),
+            Confirm::Asset(_) => {
+                ("Delete asset?", "This asset will be deleted. If it is an image, its copies in the project folders are deleted too.".into())
+            }
         };
         let (mut go, mut close) = (false, ui.input(|i| i.key_pressed(egui::Key::Escape)));
         egui::Window::new(title)
@@ -547,7 +644,7 @@ impl App {
     }
 }
 
-impl eframe::App for App {
+impl eframe::App for App<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.projects_panel(ui);
         self.status_bar(ui);
@@ -592,14 +689,11 @@ fn asset_row(ui: &mut egui::Ui, store: &Store, a: &Asset) -> bool {
             ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
                 edit = ui.button("Edit").clicked();
                 ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
-                    if let Kind::Image { file } = &a.kind {
+                    if let Some(path) = store.image_of(a) {
                         ui.add(
-                            egui::Image::new(format!(
-                                "file://{}",
-                                store.image_path(file).display()
-                            ))
-                            .max_width(160.0)
-                            .max_height(100.0),
+                            egui::Image::new(format!("file://{}", path.display()))
+                                .max_width(160.0)
+                                .max_height(100.0),
                         );
                     }
                     ui.vertical(|ui| {
