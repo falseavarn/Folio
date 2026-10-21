@@ -1,7 +1,10 @@
+mod background;
+mod install;
 mod store;
 
+use background::Msg;
 use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, RichText, Stroke, vec2};
-use std::path::PathBuf;
+use std::{collections::VecDeque, path::PathBuf, process::ExitCode, sync::mpsc};
 use store::{Asset, Kind, Store};
 
 // FalseAvarn palette (falseavarn/src/index.css) plus Folio's identity color, moss.
@@ -15,7 +18,42 @@ const MUTED: Color32 = Color32::from_rgb(0xA1, 0xA1, 0xAA);
 const MOSS: Color32 = Color32::from_rgb(0x8B, 0xC3, 0x4A);
 const DANGER: Color32 = Color32::from_rgb(0xF8, 0x71, 0x71);
 
-fn main() -> eframe::Result {
+const USAGE: &str = "Usage: folio [--add <image>...] [--install | --uninstall]";
+
+fn main() -> ExitCode {
+    let mut args = std::env::args_os().skip(1);
+    let first = args.next();
+    let msgs: Vec<Msg> = match first.as_ref().map(|a| a.to_string_lossy()).as_deref() {
+        None => vec![Msg::Show],
+        Some("--add") => {
+            let images: Vec<Msg> = args
+                .filter_map(|a| std::path::absolute(a).ok())
+                .map(Msg::AddImage)
+                .collect();
+            if images.is_empty() {
+                vec![Msg::Show]
+            } else {
+                images
+            }
+        }
+        Some(flag @ ("--install" | "--uninstall")) => {
+            return match install::run(flag == "--install") {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("folio {flag}: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Some(_) => {
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    if background::hand_off(&msgs) {
+        return ExitCode::SUCCESS;
+    }
+
     let mut store = match Store::open(Store::default_root()) {
         Ok(s) => s,
         Err(e) => {
@@ -26,30 +64,81 @@ fn main() -> eframe::Result {
                 .set_title("Folio")
                 .set_description(msg)
                 .show();
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
     };
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+    // One context for every window Folio opens, so styling and loaded images carry over.
+    let ctx = egui::Context::default();
+    style(&ctx);
+    egui_extras::install_image_loaders(&ctx);
+
+    let (tx, rx) = mpsc::channel();
+    for msg in msgs {
+        let _ = tx.send(msg);
+    }
+    if let Err(e) = background::listen(tx.clone(), ctx.clone()) {
+        eprintln!("Folio will not receive requests from other launches: {e}");
+    }
+    #[cfg(target_os = "linux")]
+    let tray = background::tray(tx.clone(), ctx.clone());
+    #[cfg(target_os = "linux")]
+    let stays_in_background = tray.is_some();
+    // shortcut: tray only on Linux (its KSNI backend runs on its own thread); Windows and macOS need their tray on the main event loop.
+    #[cfg(not(target_os = "linux"))]
+    let stays_in_background = false;
+
+    let (mut quit, mut next) = (false, None);
+    loop {
+        // With no window open, wait here for the tray or another launch.
+        let msg = match next.take() {
+            Some(msg) => msg,
+            None => match rx.recv() {
+                Ok(msg) => msg,
+                Err(_) => break,
+            },
+        };
+        if msg == Msg::Quit {
+            break;
+        }
+        let popup = msg != Msg::Show;
+        let viewport = egui::ViewportBuilder::default()
             .with_app_id("folio")
-            .with_title("Folio")
-            .with_inner_size([1120.0, 720.0])
-            .with_min_inner_size([820.0, 480.0])
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../icons/128x128@2x.png"))
                     .expect("bundled icon is a valid PNG"),
-            ),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Folio",
-        options,
-        Box::new(|cc| {
-            egui_extras::install_image_loaders(&cc.egui_ctx);
-            style(&cc.egui_ctx);
-            Ok(Box::new(App::new(&mut store)))
-        }),
-    )
+            );
+        let viewport = if popup {
+            viewport
+                .with_title("Add to Folio")
+                .with_inner_size([440.0, 640.0])
+                .with_min_inner_size([360.0, 420.0])
+        } else {
+            viewport
+                .with_title("Folio")
+                .with_inner_size([1120.0, 720.0])
+                .with_min_inner_size([820.0, 480.0])
+        };
+        let options = eframe::NativeOptions {
+            viewport,
+            ..Default::default()
+        };
+        let app = App::new(&mut store, &rx, &mut quit, &mut next, popup, msg);
+        if let Err(e) = eframe::run_native_ext(
+            "Folio",
+            options,
+            Some(ctx.clone()),
+            Box::new(|_| Ok(Box::new(app))),
+        ) {
+            eprintln!("Folio's window failed: {e}");
+            background::stop_listening();
+            return ExitCode::FAILURE;
+        }
+        if quit || (!stays_in_background && next.is_none()) {
+            break;
+        }
+    }
+    background::stop_listening();
+    ExitCode::SUCCESS
 }
 
 fn style(ctx: &egui::Context) {
@@ -109,7 +198,7 @@ impl Filter {
     }
 }
 
-/// An asset being created (`id == None`) or edited in the side editor.
+/// An asset being created (`id == None`) or edited in the side editor or the popup.
 struct Draft {
     id: Option<u64>,
     kind: Kind,
@@ -130,8 +219,16 @@ enum Confirm {
     Asset(u64),
 }
 
+/// One window: the full library, or the small "Add to Folio" popup (`popup`).
+/// It borrows what outlives the window from `main`.
 struct App<'a> {
     store: &'a mut Store,
+    rx: &'a mpsc::Receiver<Msg>,
+    quit: &'a mut bool,
+    /// What `main` should open after this window closes.
+    next: &'a mut Option<Msg>,
+    popup: bool,
+    queue: VecDeque<Msg>,
     project: Option<u64>,
     filter: Filter,
     new_project: Option<NewProject>,
@@ -144,10 +241,22 @@ struct App<'a> {
 }
 
 impl<'a> App<'a> {
-    fn new(store: &'a mut Store) -> Self {
+    fn new(
+        store: &'a mut Store,
+        rx: &'a mpsc::Receiver<Msg>,
+        quit: &'a mut bool,
+        next: &'a mut Option<Msg>,
+        popup: bool,
+        first: Msg,
+    ) -> Self {
         let error = (!store.warnings.is_empty()).then(|| store.warnings.join(" "));
-        Self {
+        let mut app = Self {
             store,
+            rx,
+            quit,
+            next,
+            popup,
+            queue: VecDeque::new(),
             project: None,
             filter: Filter::All,
             new_project: None,
@@ -156,6 +265,69 @@ impl<'a> App<'a> {
             confirm: None,
             error,
             notice: None,
+        };
+        app.open_request(first);
+        app
+    }
+
+    /// Handles a request from the tray or another launch while this window is open.
+    fn handle(&mut self, ctx: &egui::Context, msg: Msg) {
+        match msg {
+            Msg::Quit => {
+                *self.quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Msg::Show if self.popup => {
+                *self.next = Some(Msg::Show);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Msg::Show => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
+            add if self.draft.is_some() => self.queue.push_back(add),
+            add => {
+                self.open_request(add);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
+    }
+
+    fn open_request(&mut self, msg: Msg) {
+        let (kind, picked) = match msg {
+            Msg::NewLink => (Kind::Link { url: String::new() }, None),
+            Msg::NewNote => (
+                Kind::Note {
+                    body: String::new(),
+                },
+                None,
+            ),
+            Msg::AddImage(path) if store::is_image(&path) && path.is_file() => (
+                Kind::Image {
+                    file: String::new(),
+                },
+                Some(path),
+            ),
+            Msg::AddImage(path) => {
+                self.error = Some(format!(
+                    "{} is not a PNG, JPEG, GIF or WebP image.",
+                    path.display()
+                ));
+                return;
+            }
+            Msg::Show | Msg::Quit => return,
+        };
+        self.open_draft(None);
+        if let Some(d) = &mut self.draft {
+            d.kind = kind;
+            d.picked = picked;
+        }
+    }
+
+    /// Closes the editor, then opens the next queued request, or closes the popup when none is left.
+    fn close_draft(&mut self, ctx: &egui::Context) {
+        self.draft = None;
+        if let Some(msg) = self.queue.pop_front() {
+            self.open_request(msg);
+        } else if self.popup {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -330,16 +502,55 @@ impl<'a> App<'a> {
             });
     }
 
+    /// The small window opened from the tray or the Files right-click menu.
+    fn popup_panel(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default()
+            .frame(Frame::NONE.fill(RAISED).inner_margin(20.0))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::Image::new(egui::include_image!("../icons/64x64.png"))
+                                .fit_to_exact_size(vec2(24.0, 24.0)),
+                        );
+                        ui.label(
+                            RichText::new("Add to Folio")
+                                .size(20.0)
+                                .strong()
+                                .color(CANVAS),
+                        );
+                    });
+                    ui.add_space(12.0);
+                    if let Some(e) = &self.error {
+                        ui.label(RichText::new(e).color(DANGER));
+                    }
+                    if self.store.lib.projects.is_empty() {
+                        ui.label("Create a project in Folio first, then add to it from here.");
+                        if ui.add(primary("Open Folio")).clicked() {
+                            *self.next = Some(Msg::Show);
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    } else if self.draft.is_some() {
+                        self.editor_form(ui);
+                    } else if ui.button("Close").clicked() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
+    }
+
     fn editor_form(&mut self, ui: &mut egui::Ui) {
         let (mut save, mut cancel, mut delete) = (false, false, None);
         let store = &*self.store;
         let Some(d) = &mut self.draft else { return };
-        ui.heading(if d.id.is_some() {
-            "Edit asset"
-        } else {
-            "New asset"
-        });
-        ui.add_space(8.0);
+        if !self.popup {
+            ui.heading(if d.id.is_some() {
+                "Edit asset"
+            } else {
+                "New asset"
+            });
+            ui.add_space(8.0);
+        }
         if d.id.is_none() {
             ui.horizontal(|ui| {
                 for (label, kind) in [
@@ -457,11 +668,11 @@ impl<'a> App<'a> {
                 d.projects.clone(),
                 d.picked.as_deref(),
             ) {
-                Ok(()) => self.draft = None,
+                Ok(()) => self.close_draft(ui.ctx()),
                 Err(e) => d.error = Some(e.to_string()),
             }
         } else if cancel {
-            self.draft = None;
+            self.close_draft(ui.ctx());
         } else if delete.is_some() {
             self.confirm = delete.map(Confirm::Asset);
         }
@@ -633,7 +844,7 @@ impl<'a> App<'a> {
                 }
                 Confirm::Asset(id) => {
                     if report(&mut self.error, self.store.delete_asset(id)).is_some() {
-                        self.draft = None;
+                        self.close_draft(ui.ctx());
                     }
                 }
             }
@@ -646,10 +857,17 @@ impl<'a> App<'a> {
 
 impl eframe::App for App<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.projects_panel(ui);
-        self.status_bar(ui);
-        self.editor_panel(ui);
-        self.assets_panel(ui);
+        while let Ok(msg) = self.rx.try_recv() {
+            self.handle(&ui.ctx().clone(), msg);
+        }
+        if self.popup {
+            self.popup_panel(ui);
+        } else {
+            self.projects_panel(ui);
+            self.status_bar(ui);
+            self.editor_panel(ui);
+            self.assets_panel(ui);
+        }
         self.confirm_window(ui);
     }
 }
