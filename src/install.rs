@@ -4,8 +4,6 @@
 
 use std::{fs, io, path::PathBuf};
 
-const MIME_TYPES: &str = "image/png;image/jpeg;image/gif;image/webp;";
-
 fn targets() -> (PathBuf, PathBuf, PathBuf) {
     let data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -33,7 +31,11 @@ pub fn run(install: bool) -> io::Result<()> {
         return Ok(());
     }
 
-    let exe = std::env::current_exe()?;
+    // Inside an AppImage the binary runs from a temporary mount; point at the .AppImage file instead.
+    let exe = match std::env::var_os("APPIMAGE") {
+        Some(appimage) => PathBuf::from(appimage),
+        None => std::env::current_exe()?,
+    };
     let exe = exe
         .to_str()
         .ok_or_else(|| io::Error::other("Folio's path is not valid UTF-8"))?;
@@ -46,13 +48,11 @@ pub fn run(install: bool) -> io::Result<()> {
     for path in [&desktop, &icon, &script] {
         fs::create_dir_all(path.parent().unwrap_or(path))?;
     }
+    // The same entry the packages install, pointed at this binary.
+    let entry = include_str!("../packaging/folio.desktop");
     fs::write(
         &desktop,
-        format!(
-            "[Desktop Entry]\nType=Application\nName=Folio\nComment=Classify research links, images and notes by project\n\
-             Exec=\"{exe}\" --add %F\nIcon=folio\nTerminal=false\nCategories=Office;\nMimeType={MIME_TYPES}\n\
-             StartupWMClass=folio\n"
-        ),
+        entry.replace("Exec=folio ", &format!("Exec=\"{exe}\" ")),
     )?;
     fs::write(&icon, include_bytes!("../icons/128x128@2x.png"))?;
     // Nautilus passes the selection as newline-separated absolute paths; split on newlines only, no globbing.
@@ -73,8 +73,21 @@ pub fn run(install: bool) -> io::Result<()> {
 // shortcut: desktop integration is Linux-only; add Windows registry verbs and a macOS Service when those builds ship.
 #[cfg(not(target_os = "linux"))]
 pub fn run(_: bool) -> io::Result<()> {
-    let _ = (targets, MIME_TYPES);
+    let _ = targets;
     Err(io::Error::other(
         "--install is only available on Linux so far",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn desktop_entry_has_one_exec_line_to_rewrite() {
+        assert_eq!(
+            include_str!("../packaging/folio.desktop")
+                .matches("Exec=folio ")
+                .count(),
+            1
+        );
+    }
 }

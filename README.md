@@ -2,7 +2,19 @@
 
 A desktop app for collecting research assets (links, images and notes) and tagging each one with the research projects it belongs to. Part of the FalseAvarn suite. Identity color: moss `#8BC34A`.
 
-## Run
+## Install
+
+Download a package from [Releases](https://github.com/falseavarn/Folio/releases). Folio needs a 64-bit Linux with glibc 2.39 or newer (Fedora 40+, Ubuntu 24.04+, Debian 13+).
+
+- **Fedora, openSUSE:** `sudo dnf install ./folio-*.x86_64.rpm`
+- **Ubuntu, Debian:** `sudo apt install ./folio_*_amd64.deb`
+- **Any distribution:** `chmod +x Folio-*-x86_64.AppImage` and run it.
+
+Then run `folio --install` (or `./Folio-*.AppImage --install`) once to add **Scripts ▸ Add to Folio** to the Files right-click menu.
+
+To check a download, run `sha256sum -c SHA256SUMS --ignore-missing` in the download folder, or verify that GitHub built it from this repository with `gh attestation verify <file> -R falseavarn/Folio`.
+
+## Run from source
 
 Requires a Rust toolchain (stable, edition 2024).
 
@@ -48,3 +60,14 @@ This adds Folio to the app menu, lists it under Open With for images, and adds *
 ## Stack
 
 Rust with [egui/eframe](https://github.com/emilk/egui) 0.37, `egui_extras` for image loading (PNG, JPEG, GIF, WebP), [`rfd`](https://github.com/PolyMeilex/rfd) for the native file picker, `serde_json` for storage, and [`tray-icon`](https://github.com/tauri-apps/tray-icon) (D-Bus StatusNotifierItem backend) for the Linux tray.
+
+## Releasing
+
+1. Set the new version in `Cargo.toml` and commit it.
+2. Tag the commit with the same version and push the tag: `git tag v0.2.0 && git push origin v0.2.0`.
+
+The [Release workflow](.github/workflows/release.yml) runs only for tags of the form `vMAJOR.MINOR.PATCH`. It checks that the tag matches `Cargo.toml`, runs the tests, builds the `.deb`, `.rpm` and AppImage with [packaging/build.sh](packaging/build.sh), attests them, and publishes them with a `SHA256SUMS` file as a GitHub release. To build the packages locally, install `cargo-deb`, `cargo-generate-rpm` and `appimagetool`, then run `packaging/build.sh`.
+
+## License
+
+[MIT](LICENSE)

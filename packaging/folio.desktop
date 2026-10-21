@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Folio
+Comment=Classify research links, images and notes by project
+Exec=folio --add %F
+Icon=folio
+Terminal=false
+Categories=Office;
+MimeType=image/png;image/jpeg;image/gif;image/webp;
+StartupWMClass=folio

@@ -21,3 +21,31 @@ serde_json = "1"
 [target.'cfg(target_os = "linux")'.dependencies]
 tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
 
+# Linux packages, built by packaging/build.sh (cargo-deb, cargo-generate-rpm).
+[package.metadata.deb]
+section = "utils"
+license-file = ["LICENSE", "0"]
+extended-description = "Folio files research links, images and notes by project. Each project lives in its own folder, and a tray icon and the Files right-click menu let you add to it from anywhere."
+assets = [
+    ["target/release/folio", "usr/bin/", "755"],
+    ["packaging/folio.desktop", "usr/share/applications/", "644"],
+    ["icons/32x32.png", "usr/share/icons/hicolor/32x32/apps/folio.png", "644"],
+    ["icons/64x64.png", "usr/share/icons/hicolor/64x64/apps/folio.png", "644"],
+    ["icons/128x128.png", "usr/share/icons/hicolor/128x128/apps/folio.png", "644"],
+    ["icons/128x128@2x.png", "usr/share/icons/hicolor/256x256/apps/folio.png", "644"],
+    ["icons/icon.png", "usr/share/icons/hicolor/512x512/apps/folio.png", "644"],
+    ["README.md", "usr/share/doc/folio/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/folio", dest = "/usr/bin/folio", mode = "755" },
+    { source = "packaging/folio.desktop", dest = "/usr/share/applications/folio.desktop", mode = "644" },
+    { source = "icons/32x32.png", dest = "/usr/share/icons/hicolor/32x32/apps/folio.png", mode = "644" },
+    { source = "icons/64x64.png", dest = "/usr/share/icons/hicolor/64x64/apps/folio.png", mode = "644" },
+    { source = "icons/128x128.png", dest = "/usr/share/icons/hicolor/128x128/apps/folio.png", mode = "644" },
+    { source = "icons/128x128@2x.png", dest = "/usr/share/icons/hicolor/256x256/apps/folio.png", mode = "644" },
+    { source = "icons/icon.png", dest = "/usr/share/icons/hicolor/512x512/apps/folio.png", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/folio/LICENSE", mode = "644", doc = true },
+    { source = "README.md", dest = "/usr/share/doc/folio/README.md", mode = "644", doc = true },
+]

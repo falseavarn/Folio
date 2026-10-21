@@ -1,0 +1,63 @@
+name: Release
+
+# Runs only for release tags such as v1.2.3; pre-release tags (v1.2.3-rc.1) and branches do not trigger it.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write # create the GitHub release
+  id-token: write # sign build attestations
+  attestations: write
+
+jobs:
+  linux:
+    # Binaries need the runner's glibc (2.39) or newer: Fedora 40+, Ubuntu 24.04+, Debian 13+.
+    # shortcut: build in an older container if Debian 12 or Ubuntu 22.04 users need packages.
+    runs-on: ubuntu-24.04
+    env:
+      APPIMAGETOOL_VERSION: "1.9.1"
+      APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          pkgid=$(cargo pkgid)
+          version=${pkgid##*[#@]}
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+            exit 1
+          fi
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb@3.8.0,cargo-generate-rpm@0.21.1
+
+      - name: Install appimagetool
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/appimagetool" \
+            "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
+          echo "$APPIMAGETOOL_SHA256  $RUNNER_TEMP/appimagetool" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/appimagetool"
+
+      - run: cargo test --locked
+
+      - name: Build packages
+        run: APPIMAGETOOL="$RUNNER_TEMP/appimagetool" packaging/build.sh
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.AppImage
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "Folio $GITHUB_REF_NAME" --generate-notes --verify-tag
